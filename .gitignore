@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+photos/
+lots.json
+feed.yml
