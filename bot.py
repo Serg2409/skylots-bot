@@ -6,8 +6,8 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters, ConversationHandler
 )
-from yml_generator import add_lot, generate_yml, load_lots, delete_lot
 from ai_description import generate_description
+from skylots_client import post_lot_to_skylots
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,9 +41,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Твій Chat ID: `{chat_id}`\n\n"
         f"Команди:\n"
         f"/newlot — виставити новий лот\n"
-        f"/mylots — переглянути активні лоти\n"
-        f"/deletelot — видалити лот\n"
-        f"/yml — посилання на YML файл",
+        f"/cancel — скасувати",
         parse_mode="Markdown"
     )
 
@@ -107,7 +105,7 @@ async def got_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Ціна: {price:.0f} грн\n\n"
         f"📝 Додай нотатки про стан товару:\n"
         f"_Наприклад: стан 9/10, є зарядка, акумулятор тримає добре_\n\n"
-        f"Або /skip — AI сам складе опис на основі назви",
+        f"Або /skip — AI сам складе опис",
         parse_mode="Markdown"
     )
     return NOTES
@@ -136,7 +134,7 @@ async def skip_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def got_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photos = context.user_data.get("photos", [])
     if len(photos) >= 5:
-        await update.message.reply_text("⚠️ Максимум 5 фото. Натисни /done")
+        await update.message.reply_text("⚠️ Максимум 5 фото. Напиши /done")
         return PHOTO
 
     photo = update.message.photo[-1]
@@ -164,82 +162,42 @@ async def photos_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     notes = context.user_data.get("notes", "")
     description = generate_description(title, category, notes)
 
-    lot = {
-        "id": str(int(datetime.now().timestamp())),
-        "title": title,
-        "category": category,
-        "category_name": context.user_data["category_name"],
-        "price": context.user_data["price"],
-        "description": description,
-        "photos": photos,
-        "created": datetime.now().isoformat(),
-    }
-
-    add_lot(lot)
-    generate_yml()
-
     await update.message.reply_text(
-        f"🎉 *Лот додано!*\n\n"
-        f"📦 *{lot['title']}*\n"
-        f"💰 {lot['price']:.0f} грн\n"
-        f"📂 {lot['category_name']}\n\n"
-        f"📄 *Опис (AI):*\n{description}\n\n"
-        f"🆔 ID: `{lot['id']}`\n\n"
-        f"_SkyLots підтягне лот при наступній синхронізації_\n\n"
-        f"/newlot — виставити ще один",
+        f"📄 *Опис згенеровано:*\n{description}\n\n"
+        f"⏳ Виставляю лот на SkyLots...",
         parse_mode="Markdown"
     )
+
+    # Виставляємо лот напряму на SkyLots
+    result = post_lot_to_skylots(
+        title=title,
+        price=context.user_data["price"],
+        description=description,
+        category=category,
+        photo_paths=photos,
+    )
+
+    if result.get("success"):
+        lot_url = result.get("url", "https://skylots.org")
+        await update.message.reply_text(
+            f"🎉 *Лот виставлено на SkyLots!*\n\n"
+            f"📦 *{title}*\n"
+            f"💰 {context.user_data['price']:.0f} грн\n"
+            f"📂 {context.user_data['category_name']}\n\n"
+            f"🔗 {lot_url}\n\n"
+            f"/newlot — виставити ще один",
+            parse_mode="Markdown"
+        )
+    else:
+        error = result.get("error", "невідома помилка")
+        await update.message.reply_text(
+            f"⚠️ Лот збережено локально, але не вдалось виставити на SkyLots.\n"
+            f"Помилка: {error}\n\n"
+            f"Спробуй /newlot ще раз або перевір логін/пароль.",
+        )
+
     context.user_data.clear()
     return ConversationHandler.END
-
-
-async def my_lots(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    lots = load_lots()
-    if not lots:
-        await update.message.reply_text("📭 Активних лотів немає.\n/newlot — додати перший")
-        return
-    text = f"📋 *Активні лоти ({len(lots)}):*\n\n"
-    for lot in lots:
-        text += f"🆔 `{lot['id']}`\n📦 {lot['title']}\n💰 {lot['price']:.0f} грн\n📂 {lot['category_name']}\n\n"
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-
-async def delete_lot_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    lots = load_lots()
-    if not lots:
-        await update.message.reply_text("📭 Немає лотів для видалення.")
-        return
-    keyboard = [[InlineKeyboardButton(f"❌ {lot['title'][:35]}", callback_data=f"del_{lot['id']}")] for lot in lots]
-    await update.message.reply_text("Який лот видалити?", reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    lot_id = query.data.replace("del_", "")
-    lots = load_lots()
-    lot = next((l for l in lots if l["id"] == lot_id), None)
-    if lot:
-        delete_lot(lot_id)
-        generate_yml()
-        await query.edit_message_text(f"✅ Лот *{lot['title']}* видалено.", parse_mode="Markdown")
-    else:
-        await query.edit_message_text("❌ Лот не знайдено.")
-
-
-async def get_yml_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(update):
-        return
-    base_url = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
-    yml_url = f"https://{base_url}/feed.yml" if base_url else "http://localhost:5000/feed.yml"
-    await update.message.reply_text(
-        f"🔗 Посилання на YML файл:\n`{yml_url}`\n\nВкажи це посилання в SkyLots → Синхронізація",
-        parse_mode="Markdown"
-    )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -268,10 +226,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("mylots", my_lots))
-    app.add_handler(CommandHandler("deletelot", delete_lot_start))
-    app.add_handler(CommandHandler("yml", get_yml_link))
-    app.add_handler(CallbackQueryHandler(confirm_delete, pattern="^del_"))
     app.add_handler(conv)
     logger.info("Бот запущено!")
     app.run_polling()
